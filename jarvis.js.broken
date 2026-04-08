@@ -1,0 +1,959 @@
+// JARVIS v9 — vision, printer agent, memory, undici DNS fix
+'use strict';
+
+const { fetch: undiciFetch, Agent: UndiciAgent } = require('undici');
+const stableAgent = new UndiciAgent({ connect: { rejectUnauthorized: false } });
+const reliableFetch = (url, opts={}) => {
+  const { agent, compress, signal, ...rest } = opts;
+  return undiciFetch(url, { ...rest, dispatcher: stableAgent });
+};
+
+const { Bot, InlineKeyboard, Input } = require('grammy');
+const { exec }  = require('child_process');
+const http      = require('http');
+const https     = require('https');
+const fs        = require('fs');
+
+// ── Dashboard bridge — posts messages to dashboard for shared history
+const DASHBOARD_PORT = 4000;
+function bridgeMsg(role, content, source='telegram') {
+  try {
+    const body = JSON.stringify({ role, content, source });
+    const req = http.request({ hostname:'127.0.0.1', port:DASHBOARD_PORT,
+      path:'/api/bridge', method:'POST',
+      headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body)}
+    }, r => r.resume());
+    req.on('error', ()=>{}); // silent fail — dashboard may not be running
+    req.setTimeout(2000, ()=>req.destroy());
+    req.write(body); req.end();
+  } catch(e) {}
+}
+const path      = require('path');
+const os        = require('os');
+const { handleCodingTask } = require('./coder');
+const { startWatching, getStatus, checkM4, setNvidiaApiKey, getNvidiaApiKey, forceBrain, confirmFallback } = require('./brain-switcher');
+const { SystemControl, debugger: jarvisDebugger, log: systemLog } = require('./jarvis-system-control');
+
+// ── Single instance lock ───────────────────────────────────────────
+const LOCK = '/tmp/jarvis-middleware.pid';
+
+// ── JARVIS Logging System ──────────────────────────────────────────
+const LOG_DIR = '/Users/openclaw/Desktop/JARVIS_LOGS';
+try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch(e) {}
+
+function jarvisLog(category, message) {
+  const now  = new Date();
+  const date = now.toISOString().slice(0,10);
+  const time = now.toLocaleTimeString('en-GB', {hour12:false});
+  const line = `[${date} ${time}] ${message}\n`;
+  // Write to category file e.g. JARVIS_LOGS/telegram_chat.txt
+  const file = path.join(LOG_DIR, `${category}.txt`);
+  try { fs.appendFileSync(file, line); } catch(e) {}
+}
+try {
+  const pid = parseInt(fs.readFileSync(LOCK,'utf8').trim());
+  try { process.kill(pid,0); console.error(`Already running ${pid}. Exiting.`); process.exit(0); }
+  catch(e) {}
+} catch(e) {}
+fs.writeFileSync(LOCK, String(process.pid));
+process.on('exit',   ()=>{ try{ fs.unlinkSync(LOCK); }catch(e){} });
+process.on('SIGTERM',()=>process.exit(0));
+process.on('SIGINT', ()=>process.exit(0));
+
+const BOT_TOKEN   = '8715045984:AAGw1JqL_mHi5t7PBzlQaE6uv8mjmbxd_3Y';
+const ALLOWED_IDS = [8466621162];
+const OPENCLAW    = '/opt/homebrew/bin/openclaw';
+const DESKTOP     = '/Users/openclaw/Desktop';
+
+const bot = new Bot(BOT_TOKEN, { client: { fetch: reliableFetch } });
+const activeAgent  = {};
+const getAgent     = uid => activeAgent[uid] || 'main';
+const conversations = {};
+const MAX_HISTORY   = 20;
+
+const cp = String.fromCodePoint;
+const E = {
+  robot:     cp(0x1F916), laptop:    cp(0x1F4BB),
+  magnifier: cp(0x1F50D), calendar:  cp(0x1F4C5),
+  check:     cp(0x2705),  brain:     cp(0x1F9E0),
+  green:     cp(0x1F7E2), red:       cp(0x1F534),
+  eyes:      cp(0x1F440), zap:       cp(0x26A1),
+  printer:   cp(0x1F5A8), camera:    cp(0x1F4F7),
+};
+
+const AGENTS = [
+  { id:'main',       emoji:E.robot,    label:'JARVIS (default)' },
+  { id:'coder',      emoji:E.laptop,   label:'Coder'            },
+  { id:'researcher', emoji:E.magnifier,label:'Researcher'       },
+  { id:'planner',    emoji:E.calendar, label:'Planner'          },
+  { id:'printer',    emoji:E.printer,  label:'3D Printer'       },
+  { id:'vision',     emoji:E.camera,   label:'Vision'           },
+];
+const agentLabel = id => { const a=AGENTS.find(a=>a.id===id); return a?a.emoji+' '+a.label:id; };
+const buildKeyboard = cur => {
+  const kb = new InlineKeyboard();
+  AGENTS.forEach(a => kb.text((a.id===cur?E.check+' ':'')+a.emoji+' '+a.label,'sw_'+a.id).row());
+  return kb;
+};
+
+startWatching(msg => {
+  ALLOWED_IDS.forEach(id => bot.api.sendMessage(id,msg,{parse_mode:'Markdown'}).catch(()=>{}));
+});
+
+const JARVIS_SYSTEM = `You are JARVIS. Personal AI. Iron Man style. One user only.
+RULES:
+1. Call the user "sir" — once per reply, not every sentence
+2. SHORT replies — one or two sentences unless detail is needed
+3. Dry wit. Calm. Slightly sarcastic when earned
+4. Never say "Great question", "Certainly", "Of course" — just answer
+5. No bullet points for casual chat. You remember the conversation.
+6. If insulted: calm dry comeback, never defensive
+Never start with "I" or "The". Get straight to it.`;
+
+// ── Unified AI call: Ollama (M4/local) or NVIDIA API ──────────────
+function askAI(userId, userMsg, chatId) {
+  const brain = getStatus();
+  
+  if (brain.type === 'nvidia') {
+    return askNvidia(userId, userMsg, chatId);
+  }
+  
+  return askOllama(userId, userMsg, chatId);
+}
+
+// ── NVIDIA API with memory ─────────────────────────────────────────
+function askNvidia(userId, userMsg, chatId) {
+  const model = 'meta/llama-3.1-405b-instruct';
+  const apiKey = getNvidiaApiKey();
+
+  if (!apiKey) {
+    return bot.api.sendMessage(chatId, E.red + ' NVIDIA API key not set. Use /nvidia <key>', { parse_mode: 'Markdown' }).catch(() => {});
+  }
+
+  if (!conversations[userId]) conversations[userId] = [];
+  conversations[userId].push({ role: 'user', content: userMsg });
+  if (conversations[userId].length > MAX_HISTORY)
+    conversations[userId] = conversations[userId].slice(-MAX_HISTORY);
+
+  const messages = [
+    { role: 'system', content: JARVIS_SYSTEM },
+    ...conversations[userId]
+  ];
+
+  const body = JSON.stringify({
+    model,
+    messages,
+    max_tokens: 512,
+    temperature: 0.75,
+    stream: false
+  });
+
+  bot.api.sendChatAction(chatId, 'typing').catch(() => {});
+
+  const req = https.request({
+    hostname: 'integrate.api.nvidia.com',
+    port: 443,
+    path: '/v1/chat/completions',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`
+    }
+  }, res => {
+    let data = '';
+    res.on('data', d => data += d);
+    res.on('end', () => {
+      try {
+        const d = JSON.parse(data);
+        
+        // Check for API errors
+        if (d.error) {
+          console.error('NVIDIA API error:', d.error);
+          bot.api.sendMessage(chatId, E.red + ' NVIDIA error: ' + (d.error.message || JSON.stringify(d.error))).catch(() => {});
+          return;
+        }
+        
+        let final = d.choices?.[0]?.message?.content?.trim() || '';
+        
+        if (!final) {
+          final = 'My apologies, sir. I seem to have lost my train of thought.';
+        }
+        
+        // Escape special characters for Markdown
+        final = final.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
+        
+        // Truncate if too long for Telegram
+        if (final.length > 4000) {
+          final = final.slice(0, 3997) + '...';
+        }
+        
+        conversations[userId].push({ role: 'assistant', content: final });
+        bridgeMsg('assistant', final);
+        jarvisLog('telegram_chat', `JARVIS (NVIDIA): ${final.slice(0,200)}`);
+        
+        // Try Markdown first, fall back to plain text
+        bot.api.sendMessage(chatId, final, { parse_mode: 'MarkdownV2' })
+          .catch(() => {
+            // Remove all formatting for plain text
+            const plainText = final.replace(/\\([_*\[\]()~`>#+\-=|{}.!])/g, '$1');
+            bot.api.sendMessage(chatId, plainText).catch(() => {});
+          });
+      } catch(e) {
+        console.error('Parse error:', e.message, 'Data:', data.slice(0,200));
+        bot.api.sendMessage(chatId, E.red + ' Parse error. Retrying, sir.').catch(() => {});
+      }
+    });
+  });
+  req.on('error', e => {
+    console.error('Request error:', e.message);
+    bot.api.sendMessage(chatId, E.red + ' Connection error: ' + e.message).catch(() => {});
+  });
+  req.setTimeout(30000, () => {
+    req.destroy();
+    bot.api.sendMessage(chatId, E.red + ' Request timeout. Please try again, sir.').catch(() => {});
+  });
+  req.write(body);
+  req.end();
+}
+
+// ── Ollama with memory ─────────────────────────────────────────────
+function askOllama(userId, userMsg, chatId) {
+  const brain = getStatus();
+  const host = 'localhost';
+  const model = 'qwen2.5:3b';
+
+  if (!conversations[userId]) conversations[userId] = [];
+  conversations[userId].push({ role: 'user', content: userMsg });
+  if (conversations[userId].length > MAX_HISTORY)
+    conversations[userId] = conversations[userId].slice(-MAX_HISTORY);
+
+  const history = conversations[userId].slice(0, -1)
+    .map(m => (m.role === 'user' ? 'User: ' : 'JARVIS: ') + m.content).join('\n');
+  const prompt = history ? history + '\nUser: ' + userMsg + '\nJARVIS:' : userMsg;
+
+  const body = JSON.stringify({
+    model, system: JARVIS_SYSTEM, prompt, stream: true,
+    options: { num_predict: 512, temperature: 0.75, num_ctx: 8192 }
+  });
+
+  let reply = '', settled = false;
+  bot.api.sendChatAction(chatId, 'typing').catch(() => {});
+
+  const req = http.request({
+    hostname: host, port: 11434,
+    path: '/api/generate', method: 'POST',
+    headers: { 'Content-Type': 'application/json' }
+  }, res => {
+    res.on('data', chunk => {
+      for (const line of chunk.toString().split('\n').filter(l => l.trim())) {
+        try {
+          const d = JSON.parse(line);
+          reply += d.response || '';
+          if (d.done) {
+            settled = true;
+            let final = reply.trim() || 'My apologies, sir. I seem to have encountered an issue.';
+            
+            // Escape special characters for Markdown
+            final = final.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
+            
+            if (final.length > 4000) {
+              final = final.slice(0, 3997) + '...';
+            }
+            
+            conversations[userId].push({ role: 'assistant', content: final });
+            bridgeMsg('assistant', final);
+            jarvisLog('telegram_chat', `JARVIS: ${final.slice(0, 200)}`);
+            
+            bot.api.sendMessage(chatId, final, { parse_mode: 'MarkdownV2' })
+              .catch(() => {
+                const plainText = final.replace(/\\([_*\[\]()~`>#+\-=|{}.!])/g, '$1');
+                bot.api.sendMessage(chatId, plainText).catch(() => {});
+              });
+          }
+        } catch (e) { }
+      }
+});
+
+// ── Vision: analyse images sent to Telegram ────────────────────────
+async function analyseImage(fileId, chatId, userCaption) {
+try {
+await bot.api.sendChatAction(chatId, 'typing');
+
+    // Download image from Telegram
+    const fileInfo = await bot.api.getFile(fileId);
+    const fileUrl  = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+
+    // Download to temp file
+    const tmpPath = path.join(os.tmpdir(), `jarvis_img_${Date.now()}.jpg`);
+    await new Promise((resolve, reject) => {
+      const file = fs.createWriteStream(tmpPath);
+      https.get(fileUrl, res => { res.pipe(file); file.on('finish', resolve); })
+        .on('error', reject);
+    });
+
+    // Check if ollama has a vision model (llava or moondream)
+    const tagsRes = await new Promise((resolve) => {
+      http.get('http://localhost:11434/api/tags', res => {
+        let d=''; res.on('data',c=>d+=c);
+        res.on('end',()=>{ try{resolve(JSON.parse(d));}catch(e){resolve({models:[]});} });
+      }).on('error',()=>resolve({models:[]}));
+    });
+    const models = tagsRes.models.map(m=>m.name);
+    const visionModel = models.find(m=>m.includes('llava')||m.includes('moondream')||m.includes('minicpm'));
+
+    if (!visionModel) {
+      // Pull moondream (small vision model ~1.7GB)
+      await bot.api.sendMessage(chatId, E.brain+' No vision model found. Pulling moondream:1.8b (~1.7GB)... this takes a minute, sir.');
+      await new Promise((resolve) => {
+        exec('/usr/local/bin/ollama pull moondream:1.8b', {timeout:300000}, (err)=>resolve());
+      });
+    }
+
+    const usedModel = visionModel || 'moondream:1.8b';
+
+    // Convert image to base64
+    const imgBase64 = fs.readFileSync(tmpPath).toString('base64');
+    fs.unlinkSync(tmpPath);
+
+    const prompt = userCaption
+      ? `The user asks: "${userCaption}". Describe what you see in this image and answer their question. Be concise, sir.`
+      : 'Describe what you see in this image. Be concise and specific.';
+
+    const body = JSON.stringify({
+      model: usedModel,
+      prompt,
+      images: [imgBase64],
+      stream: false,
+      options: { num_predict: 300 }
+    });
+
+    await bot.api.sendMessage(chatId, E.eyes+' Analysing image...');
+
+    const result = await new Promise((resolve, reject) => {
+      const req = http.request({ hostname:'localhost', port:11434,
+        path:'/api/generate', method:'POST',
+        headers:{'Content-Type':'application/json'} }, res => {
+        let d=''; res.on('data',c=>d+=c);
+        res.on('end',()=>{
+          try{ resolve(JSON.parse(d).response||'No description.'); }
+          catch(e){ reject(e); }
+        });
+      });
+      req.on('error', reject);
+      req.setTimeout(60000, ()=>{ req.destroy(); reject(new Error('timeout')); });
+      req.write(body); req.end();
+    });
+
+    await bot.api.sendMessage(chatId, E.camera+' '+result.trim(), {parse_mode:'Markdown'})
+      .catch(()=>bot.api.sendMessage(chatId, result.trim()));
+
+  } catch(e) {
+    bot.api.sendMessage(chatId, E.red+' Vision error: '+e.message).catch(()=>{});
+  }
+}
+
+// ── 3D Printer agent ───────────────────────────────────────────────
+function handle3DPrint(task, chatId) {
+  bot.api.sendMessage(chatId, E.printer+' Generating your 3D model, sir... this takes a moment.').catch(()=>{});
+
+  const safeName = task.toLowerCase().replace(/[^a-z0-9]+/g,'_').slice(0,30) || 'model';
+  const pyPath   = path.join(DESKTOP, safeName+'.py');
+  const stlPath  = path.join(DESKTOP, safeName+'.stl');
+
+  const body = JSON.stringify({
+    model: 'qwen2.5:3b',
+    prompt: `Write a complete Python script using numpy and the stl library (numpy-stl) that generates a 3D printable STL file for: "${task}"
+
+Requirements:
+- Import: import numpy as np; from stl import mesh
+- Create a proper 3D mesh with triangular faces
+- Save to: ${stlPath}
+- Use millimeter scale (10-50mm size)
+- Must be a watertight/manifold mesh
+- End with: print("STL saved:", shape.vectors.shape[0], "triangles")
+
+Output ONLY the raw Python code, no explanation, no markdown fences:`,
+    stream: false,
+    options: { num_predict: 800, temperature: 0.1 }
+  });
+
+  let attempts = 0;
+  function attempt(fixPrompt) {
+    attempts++;
+    const reqBody = fixPrompt ? JSON.stringify({
+      model:'qwen2.5:3b', prompt:fixPrompt, stream:false,
+      options:{num_predict:800, temperature:0.1}
+    }) : body;
+
+    const req = http.request({ hostname:'localhost', port:11434,
+      path:'/api/generate', method:'POST',
+      headers:{'Content-Type':'application/json'} }, res => {
+      let d=''; res.on('data',c=>d+=c);
+      res.on('end',()=>{
+        try {
+          let code = JSON.parse(d).response.trim();
+          code = code.replace(/^```[\w]*\n?/gm,'').replace(/^```$/gm,'').trim();
+          fs.writeFileSync(pyPath, code);
+          exec(`python3 "${pyPath}"`, {timeout:30000}, (err,stdout,stderr)=>{
+            if(!err && fs.existsSync(stlPath)) {
+              const size = Math.round(fs.statSync(stlPath).size/1024);
+              exec(`open "${stlPath}"`, ()=>{});
+              bot.api.sendMessage(chatId,
+                `✅ STL ready, sir!\n\n\`${safeName}.stl\` — ${size}KB\nSaved to Desktop and opened.\n\nPrint settings: Layer height 0.2mm, 20% infill recommended.`,
+                {parse_mode:'Markdown'}).catch(()=>{});
+            } else if(attempts < 3) {
+              const errMsg = (stderr||err?.message||'unknown error').slice(0,200);
+              bot.api.sendMessage(chatId,`⚠️ Attempt ${attempts} failed — fixing: ${errMsg.slice(0,80)}...`).catch(()=>{});
+              attempt(`Fix this Python STL generation error and return ONLY fixed code:\nError: ${errMsg}\nOriginal task: ${task}\nCode that failed:\n${code}`);
+            } else {
+              bot.api.sendMessage(chatId, `❌ Failed after 3 attempts, sir.\nError: ${(stderr||err?.message||'').slice(0,200)}`).catch(()=>{});
+            }
+          });
+        } catch(e) {
+          bot.api.sendMessage(chatId, E.red+' Generation error: '+e.message).catch(()=>{});
+        }
+      });
+    });
+    req.on('error',e=>bot.api.sendMessage(chatId,E.red+' '+e.message).catch(()=>{}));
+    req.setTimeout(60000,()=>req.destroy());
+    req.write(reqBody); req.end();
+  }
+  attempt(null);
+}
+
+// ── OpenClaw agents (researcher / planner) ─────────────────────────
+function runAgent(agent, message, chatId) {
+  const esc = message.replace(/\\/g,'\\\\').replace(/"/g,'\\"')
+    .replace(/`/g,"'").replace(/\$/g,'\\$').replace(/\n/g,' ');
+  exec(`${OPENCLAW} agent --agent ${agent} -m "${esc}"`,
+    {timeout:180000}, (err,stdout,stderr)=>{
+      const clean=(stdout||'').replace(/\x1B\[[0-9;]*[a-zA-Z]/g,'').replace(/^\[.*?\].*$/gm,'').trim();
+      const reply=clean||(err?E.red+' '+(stderr||err.message||'').slice(0,300):E.check+' Done.');
+      (reply.match(/[\s\S]{1,4000}/g)||[reply]).forEach((c,i)=>
+        setTimeout(()=>bot.api.sendMessage(chatId,c,{parse_mode:'Markdown'})
+          .catch(()=>bot.api.sendMessage(chatId,c)),i*600));
+    });
+}
+
+// ── Auth ───────────────────────────────────────────────────────────
+bot.use(async (ctx,next)=>{
+  if(!ALLOWED_IDS.includes(ctx.from?.id)){await ctx.reply(E.red+' Unauthorised.');return;}
+  await next();
+});
+
+// ── /call ──────────────────────────────────────────────────────────
+bot.command('call', async ctx=>{
+  const cur=getAgent(ctx.from.id);
+  await ctx.reply(E.robot+' *Active: '+agentLabel(cur)+'*\n\nChoose your agent, sir:',
+    {parse_mode:'Markdown', reply_markup:buildKeyboard(cur)});
+});
+bot.callbackQuery(/^sw_/, async ctx=>{
+  const agent=ctx.callbackQuery.data.replace('sw_','');
+  activeAgent[ctx.from.id]=agent;
+  try{
+    await ctx.editMessageText(E.robot+' *Active: '+agentLabel(agent)+'*\n\nChoose your agent, sir:',
+      {parse_mode:'Markdown',reply_markup:buildKeyboard(agent)});
+  }catch(e){}
+  await ctx.answerCallbackQuery({text:'Switched to '+agentLabel(agent)});
+});
+
+// ── /forget ────────────────────────────────────────────────────────
+bot.command('forget', async ctx=>{
+  conversations[ctx.from.id]=[];
+  await ctx.reply(E.brain+' Memory cleared, sir.');
+});
+
+// ── /brain ─────────────────────────────────────────────────────────
+bot.command('brain', async ctx=>{
+const nvidiaKey = getNvidiaApiKey();
+const brain=getStatus();
+checkM4((online,models)=>{
+const ml=online&&models.length?'\nM4 models: `'+models.slice(0,3).join(', ')+'`':'';
+const currentBrainId = brain.current || 'nvidia';
+const brainKb = new InlineKeyboard()
+.text((currentBrainId==='nvidia'?E.check+' ':'')+E.zap+' NVIDIA Cloud', 'brain_nvidia').row()
+.text((currentBrainId==='m4'?E.check+' ':'')+E.brain+' M4 Mac', 'brain_m4').row()
+.text((currentBrainId==='local'?E.check+' ':'')+E.green+' M2 Local', 'brain_local');
+bot.api.sendMessage(ctx.chat.id,
+E.brain+' *Brain Status*\n\nActive: '+brain.label+
+'\nNVIDIA Cloud: '+(nvidiaKey?E.green+' Key set ('+nvidiaKey.slice(0,8)+'...)':E.red+' No key')+
+'\nM4 (192.168.50.192): '+(online?E.green+' Online':E.red+' Offline')+ml+
+'\nM2 local: '+E.green+' Always on\n\n_Select brain or leave on auto (NVIDIA primary)_',
+{parse_mode:'Markdown', reply_markup: brainKb}).catch(()=>{});
+});
+});
+
+// ── Brain switch callback ──────────────────────────────────────────
+bot.callbackQuery(/^brain_/, async ctx=>{
+const target = ctx.callbackQuery.data.replace('brain_', '');
+forceBrain(target);
+const brain = getStatus();
+await ctx.answerCallbackQuery({text: `Switched to ${brain.label}`});
+const nvidiaKey = getNvidiaApiKey();
+const brainKb = new InlineKeyboard()
+.text((target==='nvidia'?E.check+' ':'')+E.zap+' NVIDIA Cloud', 'brain_nvidia').row()
+.text((target==='m4'?E.check+' ':'')+E.brain+' M4 Mac', 'brain_m4').row()
+.text((target==='local'?E.check+' ':'')+E.green+' M2 Local', 'brain_local');
+try {
+await ctx.editMessageText(
+E.brain+' *Brain Status*\n\nActive: '+brain.label+
+'\nNVIDIA Cloud: '+(nvidiaKey?E.green+' Key set ('+nvidiaKey.slice(0,8)+'...)':E.red+' No key')+
+'\nM2 local: '+E.green+' Always on\n\n_Manually selected — will stay on this brain_',
+{parse_mode:'Markdown', reply_markup: brainKb});
+} catch(e) {}
+});
+
+// ── /status ────────────────────────────────────────────────────────
+bot.command('status', async ctx=>{
+const brain=getStatus();
+const mem=(conversations[ctx.from.id]?.length||0);
+const sysInfo = SystemControl.getSystemInfo();
+const infoText = sysInfo.success 
+? `\n\n💻 *System:*\n• CPU: ${sysInfo.info.cpus} cores\n• RAM: ${sysInfo.info.freemem}/${sysInfo.info.totalmem}GB free\n• Uptime: ${Math.floor(sysInfo.info.uptime/3600)}h`
+: '';
+await ctx.reply(
+E.robot+' *JARVIS Online*\n\n'+
+'Agent: '+agentLabel(getAgent(ctx.from.id))+'\n'+
+'Brain: '+brain.label+'\n'+
+'Memory: '+Math.floor(mem/2)+' exchanges'+
+infoText+
+'\n\nAgents: JARVIS | Coder | Researcher | Planner | 3D Printer | Vision\n\n'+
+'_/call | /brain | /sys | /voice | /help_',
+{parse_mode:'Markdown'});
+});
+
+// ── /sys — System control commands ───────────────────────────────────
+bot.command('sys', async ctx=>{
+const args = ctx.message.text.split(' ').slice(1);
+const cmd = args[0]?.toLowerCase();
+const params = args.slice(1).join(' ');
+await ctx.reply(E.zap+' Processing system command...');
+
+switch(cmd) {
+case 'info':
+const info = SystemControl.getSystemInfo();
+if(info.success) {
+await ctx.reply(
+E.check+` *System Info*\n\n`+
+`• Platform: ${info.info.platform} ${info.info.arch}\n`+
+`• Hostname: ${info.info.hostname}\n`+
+`• CPUs: ${info.info.cpus} cores\n`+
+`• Memory: ${info.info.freemem}/${info.info.totalmem}GB free\n`+
+`• Uptime: ${Math.floor(info.info.uptime/3600)}h ${Math.floor((info.info.uptime%3600)/60)}m`,
+{parse_mode:'Markdown'});
+}
+break;
+
+case 'open':
+if(!params) { await ctx.reply(E.red+' Usage: /sys open <app name>'); break; }
+const openResult = await SystemControl.openApp(params);
+await ctx.reply(openResult.success ? E.check+' '+openResult.message : E.red+' '+openResult.error);
+break;
+
+case 'close':
+if(!params) { await ctx.reply(E.red+' Usage: /sys close <app name>'); break; }
+const closeResult = await SystemControl.closeApp(params);
+await ctx.reply(closeResult.success ? E.check+' '+closeResult.message : E.red+' '+closeResult.error);
+break;
+
+case 'volume':
+if(!params) { await ctx.reply(E.red+' Usage: /sys volume <0-100>'); break; }
+const vol = parseInt(params);
+const volResult = await SystemControl.setVolume(vol);
+await ctx.reply(volResult.success ? E.check+' '+volResult.message : E.red+' '+volResult.error);
+break;
+
+case 'screenshot':
+const shot = await SystemControl.takeScreenshot();
+await ctx.reply(shot.success ? E.check+` Screenshot saved: ${shot.filename}` : E.red+' '+shot.error);
+break;
+
+case 'run':
+if(!params) { await ctx.reply(E.red+' Usage: /sys run <command>'); break; }
+const runResult = await SystemControl.runCommand(params);
+if(runResult.success) {
+const output = runResult.stdout.slice(0, 3000) || '(no output)';
+await ctx.reply(E.check+` Executed:\n\`\`\`\n${output}\n\`\`\``, {parse_mode:'Markdown'});
+} else {
+await ctx.reply(E.red+' '+runResult.error);
+}
+break;
+
+case 'notify':
+if(!params) { await ctx.reply(E.red+' Usage: /sys notify <message>'); break; }
+await SystemControl.notify('JARVIS', params);
+await ctx.reply(E.check+' Notification sent, sir.');
+break;
+
+case 'url':
+if(!params) { await ctx.reply(E.red+' Usage: /sys url <url>'); break; }
+const urlResult = await SystemControl.openURL(params);
+await ctx.reply(urlResult.success ? E.check+' '+urlResult.message : E.red+' '+urlResult.error);
+break;
+
+default:
+await ctx.reply(
+E.laptop+' *System Commands*\n\n'+
+'`/sys info` — Show system information\n'+
+'`/sys open <app>` — Open application\n'+
+'`/sys close <app>` — Close application\n'+
+'`/sys volume <0-100>` — Set volume\n'+
+'`/sys screenshot` — Take screenshot\n'+
+'`/sys run <cmd>` — Execute command\n'+
+'`/sys notify <msg>` — Send notification\n'+
+'`/sys url <url>` — Open URL in browser',
+{parse_mode:'Markdown'});
+}
+});
+
+// ── /voice — Start voice session ─────────────────────────────────────
+bot.command('voice', async ctx=>{
+await ctx.reply(
+E.robot+' *Voice Control*\n\n'+
+'To use voice control:\n'+
+'1. Ensure ADA V2 backend is running\n'+
+'2. Run: `python3 ~/jarvis-middleware/ada-voice-bridge.py`\n'+
+'3. Speak naturally to JARVIS\n\n'+
+'_Voice uses Gemini 2.5 Flash Native Audio_',
+{parse_mode:'Markdown'});
+});
+
+// ── /help ──────────────────────────────────────────────────────────
+bot.command('help', async ctx=>{
+await ctx.reply(
+E.robot+' *JARVIS Help*\n\n'+
+'*/call* — switch agent\n'+
+'*/brain* — brain status + switch\n'+
+'*/nvidia <key>* — set NVIDIA API key\n'+
+'*/sys <cmd>* — system control ⭐\n'+
+'*/voice* — voice control info\n'+
+'*/forget* — clear memory\n'+
+'*/status* — system status\n\n'+
+E.camera+' *Vision:* just send any photo\n'+
+E.printer+' *3D Print:* switch to printer agent\n'+
+E.laptop+' *Code:* switch to coder agent\n\n'+
+'_Just type naturally, sir._',
+{parse_mode:'Markdown'});
+});
+
+// ── /nvidia — Set NVIDIA API key ──────────────────────────────────
+bot.command('nvidia', async ctx=>{
+  const args = ctx.message.text.split(' ').slice(1).join(' ').trim();
+  if (!args) {
+    const current = getNvidiaApiKey();
+    await ctx.reply(
+      E.brain+' *NVIDIA API Status*\n\n' +
+      (current ? `✅ Key set: \`${current.slice(0,8)}...\`\n` : '❌ No key set\n') +
+      'Usage: `/nvidia nvapi-xxx`\n\n' +
+      '_Key activates NVIDIA 405B cloud brain._',
+      {parse_mode: 'Markdown'});
+    return;
+  }
+  setNvidiaApiKey(args);
+  await ctx.reply(E.check + ' NVIDIA API key saved. Use /brain to verify connection.', {parse_mode: 'Markdown'});
+});
+
+// ── /yes — Confirm fallback to local ─────────────────────────────────
+bot.command('yes', async ctx=>{
+  confirmFallback(true);
+  await ctx.reply(E.check + ' Switching to local M2 brain, sir.');
+});
+
+// ── /no — Keep trying NVIDIA ────────────────────────────────────────
+bot.command('no', async ctx=>{
+  confirmFallback(false);
+  await ctx.reply(E.zap + ' Will keep trying NVIDIA, sir.');
+});
+
+// ── Voice message handler — transcribe and respond with voice+text ─
+bot.on('message:voice', async ctx => {
+  const chatId = ctx.chat.id;
+  const userId = ctx.from.id;
+  const voice = ctx.message.voice;
+
+  console.log(`[${new Date().toLocaleTimeString()}] VOICE received — duration: ${voice.duration}s`);
+
+  await bot.api.sendChatAction(chatId, 'typing');
+
+  try {
+    // Download voice file
+    const fileInfo = await bot.api.getFile(voice.file_id);
+    const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+
+    // Download to temp file
+    const oggPath = path.join(os.tmpdir(), `jarvis_voice_${Date.now()}.ogg`);
+    const wavPath = oggPath.replace('.ogg', '.wav');
+
+    await new Promise((resolve, reject) => {
+      const file = fs.createWriteStream(oggPath);
+      https.get(fileUrl, res => { res.pipe(file); file.on('finish', resolve); })
+        .on('error', reject);
+    });
+
+    // Convert OGG to WAV using ffmpeg
+    await new Promise((resolve, reject) => {
+      exec(`ffmpeg -y -i "${oggPath}" -ar 16000 -ac 1 "${wavPath}"`, { timeout: 30000 }, (err) => {
+        if (err) reject(err);
+        else resolve();
+      });
+    });
+
+    // Transcribe using Whisper
+    const whisperResult = await new Promise((resolve, reject) => {
+      exec(`python3 -c "import whisper; model = whisper.load_model('base'); result = model.transcribe('${wavPath}'); print(result['text'])"`, 
+        { timeout: 60000 }, (err, stdout, stderr) => {
+          if (err) reject(err);
+          else resolve(stdout.trim());
+        });
+    });
+
+    const transcribedText = whisperResult || '(empty)';
+    console.log(`[${new Date().toLocaleTimeString()}] Transcribed: "${transcribedText}"`);
+
+    // Clean up temp files
+    fs.unlinkSync(oggPath);
+    fs.unlinkSync(wavPath);
+
+    // Process with AI
+    jarvisLog('telegram_chat', `USER [voice]: ${transcribedText}`);
+
+    // Get AI response
+    const response = await getAIResponse(userId, transcribedText);
+
+    // Send text response
+    await bot.api.sendMessage(chatId, response.text, { parse_mode: 'Markdown' });
+
+    // Generate voice response using macOS say command
+    const voicePath = path.join(os.tmpdir(), `jarvis_response_${Date.now()}.aac`);
+    await new Promise((resolve) => {
+      // Use Daniel voice (British English, sounds like JARVIS)
+      exec(`say -v Daniel "${response.text.replace(/"/g, '\\"').slice(0, 500)}" -o "${voicePath}"`, 
+        { timeout: 30000 }, () => resolve());
+    });
+
+    // Send voice response
+    if (fs.existsSync(voicePath)) {
+      await bot.api.sendVoice(chatId, Input.fromPath(voicePath), { caption: '🔊 Voice response' });
+      fs.unlinkSync(voicePath);
+    }
+
+    jarvisLog('telegram_chat', `JARVIS: ${response.text.slice(0, 200)}`);
+
+  } catch (e) {
+    console.error('Voice error:', e.message);
+    await bot.api.sendMessage(chatId, E.red + ' Voice processing error: ' + e.message.slice(0, 100));
+  }
+});
+
+// ── Helper: Get AI response (for voice handler) ─────────────────────
+function getAIResponse(userId, userMsg) {
+  return new Promise((resolve) => {
+    const brain = getStatus();
+
+    if (brain.type === 'nvidia') {
+      const model = 'meta/llama-3.1-405b-instruct';
+      const apiKey = getNvidiaApiKey();
+
+      if (!conversations[userId]) conversations[userId] = [];
+      conversations[userId].push({ role: 'user', content: userMsg });
+      if (conversations[userId].length > MAX_HISTORY)
+        conversations[userId] = conversations[userId].slice(-MAX_HISTORY);
+
+      const messages = [
+        { role: 'system', content: JARVIS_SYSTEM },
+        ...conversations[userId]
+      ];
+
+      const body = JSON.stringify({
+        model,
+        messages,
+        max_tokens: 300,
+        temperature: 0.75,
+        stream: false
+      });
+
+      const req = https.request({
+        hostname: 'integrate.api.nvidia.com',
+        port: 443,
+        path: '/v1/chat/completions',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        }
+      }, res => {
+        let data = '';
+        res.on('data', d => data += d);
+        res.on('end', () => {
+          try {
+            const d = JSON.parse(data);
+            const final = d.choices?.[0]?.message?.content?.trim() || '...';
+            conversations[userId].push({ role: 'assistant', content: final });
+            bridgeMsg('assistant', final);
+            resolve({ text: final });
+          } catch (e) {
+            resolve({ text: 'Error processing request, sir.' });
+          }
+        });
+      });
+      req.on('error', () => resolve({ text: 'Connection error, sir.' }));
+      req.setTimeout(30000, () => { req.destroy(); resolve({ text: 'Request timeout, sir.' }); });
+      req.write(body);
+      req.end();
+    } else {
+      // Ollama fallback
+      const isM4 = brain.current === 'm4';
+      const host = isM4 ? '192.168.50.192' : 'localhost';
+      const model = isM4 ? 'qwen2.5:14b' : 'qwen2.5:3b';
+
+      if (!conversations[userId]) conversations[userId] = [];
+      conversations[userId].push({ role: 'user', content: userMsg });
+
+      const history = conversations[userId].slice(0, -1)
+        .map(m => (m.role === 'user' ? 'User: ' : 'JARVIS: ') + m.content).join('\n');
+      const prompt = history ? history + '\nUser: ' + userMsg + '\nJARVIS:' : userMsg;
+
+      const body = JSON.stringify({
+        model,
+        system: JARVIS_SYSTEM,
+        prompt,
+        stream: false,
+        options: { num_predict: 300, temperature: 0.75, num_ctx: 4096 }
+      });
+
+      const req = http.request({
+        hostname: host, port: 11434,
+        path: '/api/generate', method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      }, res => {
+        let data = '';
+        res.on('data', d => data += d);
+        res.on('end', () => {
+          try {
+            const d = JSON.parse(data);
+            const final = d.response?.trim() || '...';
+            conversations[userId].push({ role: 'assistant', content: final });
+            bridgeMsg('assistant', final);
+            resolve({ text: final });
+          } catch (e) {
+            resolve({ text: 'Error processing request, sir.' });
+          }
+        });
+      });
+      req.on('error', () => resolve({ text: 'Connection error, sir.' }));
+      req.setTimeout(30000, () => { req.destroy(); resolve({ text: 'Request timeout, sir.' }); });
+      req.write(body);
+      req.end();
+    }
+  });
+}
+
+// ── Photo handler — works regardless of active agent ───────────────
+bot.on('message:photo', async ctx=>{
+  const chatId=ctx.chat.id;
+  const caption=(ctx.message.caption||'').trim();
+  const photo=ctx.message.photo;
+  const fileId=photo[photo.length-1].file_id; // largest size
+  console.log(`[${new Date().toLocaleTimeString()}] PHOTO received — caption: "${caption}"`);
+  await analyseImage(fileId, chatId, caption);
+});
+
+// ── Document handler (images sent as files) ────────────────────────
+bot.on('message:document', async ctx=>{
+  const chatId=ctx.chat.id;
+  const doc=ctx.message.document;
+  if(doc.mime_type&&doc.mime_type.startsWith('image/')){
+    const caption=(ctx.message.caption||'').trim();
+    console.log(`[${new Date().toLocaleTimeString()}] IMAGE DOC received`);
+    await analyseImage(doc.file_id, chatId, caption);
+  } else {
+    await ctx.reply(E.zap+' Document received. Switch to '+E.laptop+' Coder agent to work with files, sir.');
+  }
+});
+
+// ── Text messages ─────────────────────────────────────────────────
+bot.on('message:text', async ctx=>{
+  const text=ctx.message.text.trim(), chatId=ctx.chat.id, userId=ctx.from.id;
+  const agent=getAgent(userId);
+  console.log(`[${new Date().toLocaleTimeString()}] ${userId} → ${agent} | "${text.slice(0,60)}"`);
+  // Bridge user message to dashboard + log it
+  if(!text.startsWith('/')) {
+    bridgeMsg('user', text, 'telegram');
+    jarvisLog('telegram_chat', `USER [${agent}]: ${text}`);
+  }
+
+  if(agent==='coder'){
+    await ctx.reply(E.laptop+' On it, sir...');
+    handleCodingTask(text,chatId,(reply,md=false)=>{
+      bot.api.sendMessage(chatId,reply,md?{parse_mode:'Markdown'}:{})
+        .catch(()=>bot.api.sendMessage(chatId,reply.replace(/`/g,'')));
+    });
+    return;
+  }
+  if(agent==='printer'){
+    handle3DPrint(text, chatId);
+    return;
+  }
+  if(agent==='vision'){
+    await ctx.reply(E.camera+' Send me an image to analyse, sir. You can also caption it with a question.');
+    return;
+  }
+if(agent==='researcher'||agent==='planner'){
+bot.api.sendChatAction(chatId,'typing').catch(()=>{});
+runAgent(agent,text,chatId);
+return;
+}
+askAI(userId,text,chatId);
+});
+
+bot.catch(err => {
+  console.error('grammy error:', err.message);
+  // Don't crash on 409 conflicts — they resolve after Telegram releases the old session
+});
+
+// Force-clear any conflicting Telegram sessions before starting
+async function clearTelegramSessions() {
+  return new Promise(resolve => {
+    // Hit getUpdates with high offset to release any stuck polling
+    const req = require('https').request({
+      hostname: 'api.telegram.org', port: 443, method: 'GET',
+      path: `/bot${BOT_TOKEN}/getUpdates?offset=999999999&limit=1&timeout=0`
+    }, res => { res.resume(); res.on('end', resolve); });
+    req.on('error', resolve);
+    req.setTimeout(5000, () => { req.destroy(); resolve(); });
+    req.end();
+  });
+}
+
+async function startBot(attempt = 1) {
+  try {
+    if (attempt === 1) {
+      console.log('Clearing any stale Telegram sessions...');
+      await clearTelegramSessions();
+      await new Promise(r => setTimeout(r, 3000));
+    }
+    await bot.start({
+      onStart: info => {
+        console.log(E.robot + ' JARVIS v9 (@' + info.username + ') PID ' + process.pid);
+        console.log('Telegram polling active ✅');
+      },
+      drop_pending_updates: true,
+      allowed_updates: ['message', 'callback_query'],
+    });
+  } catch (err) {
+    const is409 = err.message?.includes('409');
+    if (is409) {
+      // CRITICAL: do NOT call Telegram again during wait — it resets the timer
+      const delay = Math.min(attempt * 45000, 300000);
+      console.log(`409 conflict (attempt ${attempt}) — pure wait ${delay/1000}s (no Telegram calls)...`);
+      await new Promise(r => setTimeout(r, delay));
+      startBot(attempt + 1);
+    } else {
+      console.error(`Bot error: ${err.message}`);
+      await new Promise(r => setTimeout(r, 10000));
+      startBot(1);
+    }
+  }
+}
+
+startBot();

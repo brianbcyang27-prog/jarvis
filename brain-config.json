@@ -1,0 +1,32 @@
+{
+  "comment": "JARVIS Brain Configuration - Edit this to change default behavior",
+  "priority": ["nvidia", "m4", "local"],
+  "models": {
+    "nvidia": {
+      "model": "meta/llama-3.1-405b-instruct",
+      "alternatives": [
+        "meta/llama-3.1-70b-instruct",
+        "nvidia/llama-3.1-nemotron-70b-instruct"
+      ],
+      "label": "NVIDIA Cloud (405B)",
+      "maxTokens": 512,
+      "temperature": 0.75
+    },
+    "m4": {
+      "model": "qwen2.5:14b",
+      "ip": "192.168.50.192",
+      "port": 11434,
+      "label": "M4 Brain (14b)",
+      "maxTokens": 512,
+      "temperature": 0.75
+    },
+    "local": {
+      "model": "qwen2.5:3b",
+      "label": "M2 Local (3b)",
+      "maxTokens": 512,
+      "temperature": 0.75
+    }
+  },
+  "nvidia_api_key": "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",
+  "_instructions": "To use NVIDIA API: Set your key via /nvidia <key> in Telegram or set NVIDIA_API_KEY environment variable"
+}
