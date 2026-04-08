@@ -778,7 +778,7 @@ async function startBot(attempt = 1) {
 // });
 
 // Start service monitoring
-// monitorServices();
+monitorServices();
 
 // ── Callback query handler for inline buttons ────────────────────────────
 bot.on('callback_query:data', async ctx => {

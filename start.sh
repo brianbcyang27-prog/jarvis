@@ -44,4 +44,8 @@ log "Clearing Telegram session..."
 sleep 5
 
 log "Starting JARVIS bot..."
-exec /opt/homebrew/bin/node /Users/openclaw/jarvis-middleware/jarvis-fixed.js --single
+exec /opt/homebrew/bin/node /Users/openclaw/jarvis-middleware/jarvis-autonomous-final.js --single &
+
+# Start supervisor agent in background
+log "Starting supervisor agent..."
+/opt/homebrew/bin/node /Users/openclaw/jarvis-middleware/supervisor-agent.js >> /tmp/jarvis-supervisor-agent.log 2>&1 &
