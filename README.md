@@ -1,6 +1,8 @@
 # JARVIS v12 - Fully Autonomous AI Assistant
 
-JARVIS (Just A Rather Very Intelligent System) v12 is a cutting-edge autonomous AI assistant with advanced capabilities including voice interaction, system control, and multi-platform bot integration.
+JARVIS (Just A Rather Very Intelligent System) v12 is an autonomous AI assistant based on the OpenClaw framework with enhanced capabilities including voice interaction, system control, and multi-platform bot integration.
+
+**Note**: This project is derived from the OpenClaw framework and modified for autonomous operation.
 
 ## Features
 
@@ -84,8 +86,13 @@ Edit `brain-config.json` to customize JARVIS behavior:
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
+## Disclaimer
+
+This project is based on the OpenClaw framework. All modifications and enhancements made to create JARVIS v12 are original work. Users should ensure they comply with the terms of the original OpenClaw license and any applicable copyright laws.
+
 ## Acknowledgments
 
+- OpenClaw framework for the base implementation
 - OpenAI for GPT models
 - Telegram and Discord for bot platforms
 - Node.js community for runtime environment
